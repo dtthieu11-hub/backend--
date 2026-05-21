@@ -1,10 +1,9 @@
 """
 main.py - Plant Disease Detection API
-Python 3.9 + TensorFlow 2.20 / Keras 3.10
-Fix: quantization_config + TrueDivide ops
+Auto-download model từ Google Drive nếu chưa có
 """
 
-import json, sys, io, zipfile, tempfile, shutil
+import json, sys, io, zipfile, tempfile, shutil, requests
 from pathlib import Path
 
 import numpy as np
@@ -27,60 +26,77 @@ MODEL_PATH   = Path("model/plant_disease_model2.keras")
 CLASSES_PATH = Path("model/classes.txt")
 IMG_SIZE     = (224, 224)
 
+# Google Drive file ID
+GDRIVE_FILE_ID = "1Hbrwc3u0GPr-0MahbG_YMOGRZOeKoFKh"
+
 # ─────────────────────────────────────────────
-# Patch toàn bộ config (đệ quy)
+# Download model từ Google Drive
+# ─────────────────────────────────────────────
+def download_from_gdrive(file_id: str, dest: Path):
+    print(f"[INFO] Đang download model từ Google Drive...")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    URL = "https://drive.google.com/uc?export=download"
+    session = requests.Session()
+
+    # Lần 1: lấy confirm token
+    response = session.get(URL, params={"id": file_id}, stream=True)
+    token = None
+    for key, value in response.cookies.items():
+        if key.startswith("download_warning"):
+            token = value
+            break
+
+    # Lần 2: download với token
+    if token:
+        response = session.get(URL, params={"id": file_id, "confirm": token}, stream=True)
+
+    total = 0
+    with open(dest, "wb") as f:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                f.write(chunk)
+                total += len(chunk)
+                print(f"[INFO] Downloaded {total // (1024*1024)} MB...", end="\r")
+
+    print(f"\n[OK] Download xong: {dest} ({total // (1024*1024)} MB)")
+
+
+# ─────────────────────────────────────────────
+# Patch config
 # ─────────────────────────────────────────────
 def clean_node(node):
-    """Đệ quy xóa các key không tương thích và fix TrueDivide."""
     if not isinstance(node, dict):
         return node
-
-    # Xóa quantization_config (không tồn tại trong Keras 3.10)
     node.pop("quantization_config", None)
-
-    # Xóa shared_object_id trong dtype (gây conflict)
     if node.get("class_name") == "DTypePolicy":
         node.get("config", {}).pop("shared_object_id", None)
     node.pop("shared_object_id", None)
-
-    # Đệ quy vào tất cả values
     for k, v in node.items():
         if isinstance(v, dict):
             node[k] = clean_node(v)
         elif isinstance(v, list):
             node[k] = [clean_node(i) if isinstance(i, dict) else i for i in v]
-
     return node
 
 
 def patch_config(config: dict) -> dict:
-    """
-    1. Xóa quantization_config và shared_object_id ở mọi layer
-    2. Thay TrueDivide + Subtract → Rescaling(1/127.5, -1)
-    """
-    # Bước 1: clean toàn bộ
     config = clean_node(config)
-
-    # Bước 2: thay TrueDivide + Subtract
     layers = config.get("config", {}).get("layers", [])
     if not layers:
         return config
 
     new_layers = []
-    td_input_tensor = None   # lưu input tensor của TrueDivide
+    td_input_tensor = None
 
     for layer in layers:
         cn = layer.get("class_name", "")
-
         if cn == "TrueDivide":
-            # Lưu lại tensor input để Rescaling kế thừa
             args = layer.get("inbound_nodes", [{}])[0].get("args", [])
             if args and isinstance(args[0], dict):
                 td_input_tensor = args[0]
-            continue   # bỏ qua layer này
-
+            continue
         if cn == "Subtract":
-            # Thay bằng Rescaling
             rescaling = {
                 "module": "keras.layers",
                 "class_name": "Rescaling",
@@ -100,15 +116,12 @@ def patch_config(config: dict) -> dict:
             }
             new_layers.append(rescaling)
             continue
-
-        # Cập nhật inbound_nodes trỏ vào "subtract" → "rescaling_preprocess"
         for node in layer.get("inbound_nodes", []):
             for arg in node.get("args", []):
                 if isinstance(arg, dict):
                     hist = arg.get("config", {}).get("keras_history", [])
                     if hist and hist[0] == "subtract":
                         hist[0] = "rescaling_preprocess"
-
         new_layers.append(layer)
 
     config["config"]["layers"] = new_layers
@@ -123,51 +136,35 @@ def load_model_patched(path: Path):
     try:
         with zipfile.ZipFile(path, "r") as zf:
             zf.extractall(tmpdir)
-
         cfg_path = tmpdir / "config.json"
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-
-        print("[INFO] Patching config (quantization_config + TrueDivide)...")
+        print("[INFO] Patching config...")
         cfg = patch_config(cfg)
         cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
-        print("[INFO] Patch xong!")
-
-        # Repack
         tmp_keras = tmpdir / "patched.keras"
         with zipfile.ZipFile(tmp_keras, "w", zipfile.ZIP_STORED) as zf:
             for f in tmpdir.iterdir():
                 if f.name != "patched.keras":
                     zf.write(f, f.name)
-
         model = keras.models.load_model(str(tmp_keras), compile=False)
-        print("[OK] Model loaded từ patched .keras")
+        print("[OK] Model loaded!")
         return model
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def load_model_safe(path: Path):
-    errors = []
-
-    # Strategy 1: patch rồi load
     try:
         return load_model_patched(path)
     except Exception as e:
-        errors.append(f"S1 (patched): {e}")
-        print(f"[WARN] {errors[-1]}")
+        print(f"[WARN] Patch failed: {e}")
 
-    # Strategy 2: rebuild thủ công + load weights
     try:
-        print("[INFO] Strategy 2: rebuild architecture thủ công...")
-        import h5py
-
-        inp = keras.Input(shape=(224, 224, 3), name="image_rgb_0_255")
-        x   = keras.layers.Rescaling(scale=1./127.5, offset=-1.0)(inp)
+        print("[INFO] Strategy 2: rebuild architecture...")
+        inp  = keras.Input(shape=(224, 224, 3), name="image_rgb_0_255")
+        x    = keras.layers.Rescaling(scale=1./127.5, offset=-1.0)(inp)
         base = keras.applications.MobileNetV2(
-            input_shape=(224, 224, 3),
-            include_top=False,
-            weights=None,
-            pooling="avg",
+            input_shape=(224, 224, 3), include_top=False, weights=None, pooling="avg"
         )
         x   = base(x)
         x   = keras.layers.Dropout(0.2)(x)
@@ -175,21 +172,15 @@ def load_model_safe(path: Path):
         x   = keras.layers.Dropout(0.2)(x)
         out = keras.layers.Dense(38, activation="softmax", name="class_probs")(x)
         m   = keras.Model(inp, out)
-
-        # Lấy weights từ bên trong .keras
         tmpdir = Path(tempfile.mkdtemp())
         with zipfile.ZipFile(str(path), "r") as zf:
             zf.extract("model.weights.h5", tmpdir)
         m.load_weights(str(tmpdir / "model.weights.h5"), by_name=True, skip_mismatch=True)
         shutil.rmtree(tmpdir, ignore_errors=True)
-
-        print("[OK] Strategy 2: rebuilt + weights loaded")
+        print("[OK] Strategy 2 OK!")
         return m
     except Exception as e:
-        errors.append(f"S2 (rebuild): {e}")
-        print(f"[WARN] {errors[-1]}")
-
-    raise RuntimeError("Không load được model:\n" + "\n".join(errors))
+        raise RuntimeError(f"Không load được model: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -200,30 +191,29 @@ def load_classes() -> list:
         lines = CLASSES_PATH.read_text(encoding="utf-8").splitlines()
         result = [l.strip() for l in lines if l.strip()]
         if result:
-            print(f"[INFO] {len(result)} classes từ classes.txt")
             return result
-
     json_path = Path("model/class_indices.json")
     if json_path.exists():
         data = json.loads(json_path.read_text(encoding="utf-8"))
-        result = [k for k, _ in sorted(data.items(), key=lambda x: x[1])]
-        print(f"[INFO] {len(result)} classes từ class_indices.json")
-        return result
-
+        return [k for k, _ in sorted(data.items(), key=lambda x: x[1])]
     print("[WARN] Không tìm thấy class names → dùng fallback")
     return [f"Class_{i}" for i in range(38)]
 
 
 # ─────────────────────────────────────────────
-# Khởi động
+# Khởi động — tự download model nếu chưa có
 # ─────────────────────────────────────────────
 if not MODEL_PATH.exists():
-    sys.exit(f"[ERROR] Không tìm thấy: {MODEL_PATH}")
+    print(f"[INFO] Model chưa có, đang download...")
+    try:
+        download_from_gdrive(GDRIVE_FILE_ID, MODEL_PATH)
+    except Exception as e:
+        sys.exit(f"[ERROR] Không download được model: {e}")
 
-print(f"[INFO] Loading model từ {MODEL_PATH} ...")
+print(f"[INFO] Loading model...")
 model   = load_model_safe(MODEL_PATH)
 CLASSES = load_classes()
-print(f"[INFO] ✅ Sẵn sàng! {len(CLASSES)} classes | ví dụ: {CLASSES[:3]}")
+print(f"[INFO] ✅ Sẵn sàng! {len(CLASSES)} classes")
 
 
 # ─────────────────────────────────────────────
@@ -277,7 +267,6 @@ async def predict(file: UploadFile = File(...)):
         tensor = preprocess(data)
     except Exception as e:
         raise HTTPException(422, f"Không đọc được ảnh: {e}")
-
     preds = model.predict(tensor, verbose=0)[0]
     idx   = int(np.argmax(preds))
     return {
@@ -297,7 +286,6 @@ async def predict_top5(file: UploadFile = File(...)):
         tensor = preprocess(data)
     except Exception as e:
         raise HTTPException(422, f"Không đọc được ảnh: {e}")
-
     preds    = model.predict(tensor, verbose=0)[0]
     top5_idx = np.argsort(preds)[::-1][:5]
     return {
