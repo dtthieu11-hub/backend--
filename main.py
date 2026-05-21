@@ -36,20 +36,12 @@ def download_from_gdrive(file_id: str, dest: Path):
     print(f"[INFO] Đang download model từ Google Drive...")
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    URL = "https://drive.google.com/uc?export=download"
     session = requests.Session()
 
-    # Lần 1: lấy confirm token
-    response = session.get(URL, params={"id": file_id}, stream=True)
-    token = None
-    for key, value in response.cookies.items():
-        if key.startswith("download_warning"):
-            token = value
-            break
+    # Dùng export link mới của Google Drive (hỗ trợ file lớn)
+    URL = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&confirm=t"
 
-    # Lần 2: download với token
-    if token:
-        response = session.get(URL, params={"id": file_id, "confirm": token}, stream=True)
+    response = session.get(URL, stream=True)
 
     total = 0
     with open(dest, "wb") as f:
